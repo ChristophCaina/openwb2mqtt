@@ -9,6 +9,9 @@
             "vehicle_already_configured": "Dieses Fahrzeug wurde schon konfiguriert. Geben Sie ein anderes MQTT-Wurzeltopic/Präfix oder eine andere Geräte-ID ein.",
             "chargepoint_already_configured": "Dieser Ladepunkt wurde schon konfiguriert. Geben Sie ein anderes MQTT-Wurzeltopic/Präfix oder eine andere Geräte-ID ein."
         },
+        "error": {
+            "invalid_device_id": "Ungültige Geräte-ID. Geben Sie eine Zahl ein (siehe Status-Tab Ihrer openWB) oder, bei Ladepunkt/Photovoltaikanlage, das Wort 'total'."
+        },
         "step": {
             "user": {
                 "data": {
@@ -25,7 +28,7 @@
                     "DEVICETYPE": "Gerätetyp",
                     "DEVICEID": "Geräte-ID in openWB (-> Status-Tab)"
                 },
-                "description": "Geben Sie einen Präfix ein, der die openWB eindeutig identifiziert.\n*Wenn Sie von MQTT zur API-Schnittstelle migrieren, geben Sie hier das MQTT-Wurzeltopic ein und die Integration erzeugt die Sensoren etc. mit den gleichen IDs.*\n\nPassen Sie die IP-Adresse an und wählen Sie den Gerätetyp aus.\nBei den  Gerätetypen Zähler, Ladepunkt, Photovoltaikanlage und Batterie ist zusätzlich die Geräte-ID erforderlich. Diese finden Sie auf dem Status-Tab Ihrer openWB.",
+                "description": "Geben Sie einen Präfix ein, der die openWB eindeutig identifiziert.\n*Wenn Sie von MQTT zur API-Schnittstelle migrieren, geben Sie hier das MQTT-Wurzeltopic ein und die Integration erzeugt die Sensoren etc. mit den gleichen IDs.*\n\nPassen Sie die IP-Adresse an und wählen Sie den Gerätetyp aus.\nBei den  Gerätetypen Zähler, Ladepunkt, Photovoltaikanlage, Batterie und IO-Gerät ist zusätzlich die Geräte-ID erforderlich. Diese finden Sie auf dem Status-Tab Ihrer openWB.\nBei den Gerätetypen Ladepunkt und Photovoltaikanlage können Sie statt einer Geräte-ID auch das Wort *total* eintragen. Dann werden die Werte über alle vorhandenen Ladepunkte bzw. PV-Anlagen aufsummiert (benötigt entsprechende openWB-Unterstützung, siehe openWB/core PR #3568).\nBeim Gerätetyp IO-Gerät können Sie statt einer Geräte-ID auch das Wort *auto* eintragen, dann verwendet openWB automatisch das einzige/erste vorhandene IO-Gerät (z.B. die Dimm & Control Box).",
                 "title": "API-Einstellungen für openWB"
             },
             "details_mqtt": {
@@ -34,7 +37,7 @@
                     "DEVICETYPE": "Gerätetyp",
                     "DEVICEID": "Geräte-ID in openWB (-> Status-Tab)"
                 },
-                "description": "Geben Sie ein MQTT-Wurzelptopic ein, unter dem die openWB auf Ihrem MQTT-Server erreichbar ist und wählen Sie den Gerätetyp aus. \nBei den  Gerätetypen Zähler, Ladepunkt, Photovoltaikanlage und Batterie ist zusätzlich die Geräte-ID erforderlich. Diese finden Sie auf dem Status-Tab Ihrer openWB.\nBeim Gerätetyp Wallbox tragen Sie die Geräte-ID 0 ein.",
+                "description": "Geben Sie ein MQTT-Wurzelptopic ein, unter dem die openWB auf Ihrem MQTT-Server erreichbar ist und wählen Sie den Gerätetyp aus. \nBei den  Gerätetypen Zähler, Ladepunkt, Photovoltaikanlage, Batterie und IO-Gerät ist zusätzlich die Geräte-ID erforderlich. Diese finden Sie auf dem Status-Tab Ihrer openWB.\nBeim Gerätetyp Wallbox tragen Sie die Geräte-ID 0 ein.\nBeim Gerätetyp IO-Gerät werden die digitalen Ausgänge (DO1-DO8) über openWBs eigene MQTT-Handschaltung gesteuert.",
                 "title": "MQTT-Einstellungen für openWB"
             },
             "chargepoint": {
@@ -70,7 +73,8 @@
                 "chargepoint": "Ladepunkt",
                 "pv": "Photovoltaikanlage",
                 "bat": "Batterie",
-                "vehicle": "Fahrzeug"
+                "vehicle": "Fahrzeug",
+                "io": "IO-Gerät (z.B. Dimm & Control)"
             }
         }
     },

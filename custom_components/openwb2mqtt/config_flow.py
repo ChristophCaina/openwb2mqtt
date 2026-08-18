@@ -24,6 +24,8 @@ from .const import (
     DOMAIN,
     MQTT_ROOT_TOPIC,
     MQTT_ROOT_TOPIC_DEFAULT,
+    AUTO_ID,
+    TOTAL_ID,
 )
 
 
@@ -109,18 +111,23 @@ class openwbmqttConfigFlow(ConfigFlow, domain=DOMAIN):
         errors = {}
 
         if user_input is not None:
-            self.stored_user_input.update(user_input)
-            if self.stored_user_input.get(DEVICETYPE) == "chargepoint":
-                return await self.async_step_chargepoint()
+            device_type = user_input.get(DEVICETYPE)
+            device_id_error = self._validate_device_id(device_type, user_input.get(DEVICEID))
+            if device_id_error:
+                errors[DEVICEID] = device_id_error
+            else:
+                self.stored_user_input.update(user_input)
+                if self.stored_user_input.get(DEVICETYPE) == "chargepoint":
+                    return await self.async_step_chargepoint()
 
-            title = self._get_title(self.stored_user_input)
-            await self.async_set_unique_id(title)
-            self._abort_if_unique_id_configured()
+                title = self._get_title(self.stored_user_input)
+                await self.async_set_unique_id(title)
+                self._abort_if_unique_id_configured()
 
-            return self.async_create_entry(
-                title=title,
-                data=self.stored_user_input,
-            )
+                return self.async_create_entry(
+                    title=title,
+                    data=self.stored_user_input,
+                )
 
         data_schema = self.add_suggested_values_to_schema(data_schema, suggested_values)
 
@@ -129,6 +136,27 @@ class openwbmqttConfigFlow(ConfigFlow, domain=DOMAIN):
             data_schema=data_schema,
             errors=errors,
         )
+
+    @staticmethod
+    def _validate_device_id(device_type: str | None, raw_device_id) -> str | None:
+        """Validate the Geräte-ID field. Returns an error code, or None if valid.
+
+        - "controller" doesn't need an ID at all (ignored either way).
+        - "pv"/"chargepoint" accept a positive integer or the literal "total"
+          (openWB simpleAPI "total" pseudo-ID, openWB/core PR #3568).
+        - "io" accepts a positive integer or the literal "auto".
+        - All other device types (counter, bat) require a positive integer.
+        """
+        if device_type == "controller":
+            return None
+        value = str(raw_device_id).strip().lower()
+        if device_type in ("pv", "chargepoint") and value == TOTAL_ID:
+            return None
+        if device_type == "io" and value == AUTO_ID:
+            return None
+        if value.isdigit():
+            return None
+        return "invalid_device_id"
 
     async def async_step_chargepoint(self, user_input=None):
         """Handle the chargepoint step of the configuration."""
@@ -165,7 +193,10 @@ class openwbmqttConfigFlow(ConfigFlow, domain=DOMAIN):
 
         if user_input[DEVICETYPE] == "controller":
             return f"{prefix}-{user_input[DEVICETYPE]}"
-        return f"{prefix}-{user_input[DEVICETYPE]}-{user_input[DEVICEID]}"
+        # str(...) covers the numeric ID (pv/chargepoint/counter/bat/io) as well as
+        # the "total" (pv/chargepoint) and "auto" (io) pseudo-IDs.
+        device_id = str(user_input[DEVICEID]).lower()
+        return f"{prefix}-{user_input[DEVICETYPE]}-{device_id}"
 
 
 class OptionsFlowHandler(OptionsFlowWithReload):

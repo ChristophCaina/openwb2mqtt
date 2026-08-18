@@ -28,6 +28,7 @@ from .const import (
     DEVICEID,
     DEVICETYPE,
     DOMAIN,
+    IO_PREFIX_ANALOG_OUTPUT,
     MANUFACTURER,
     NUMBERS_PER_CHARGEPOINT,
     openwbDynamicNumberEntityDescription,
@@ -53,6 +54,20 @@ async def async_setup_entry(
                     continue
                 entities_to_add.append(
                     OpenWB2MqttApiNumber(coordinator, description, config)
+                )
+        elif device_type == "io":
+            # Dynamic: one number entity per analog output found in the API
+            # response (e.g. "AO1"), see openWB/core PR #3568.
+            if not coordinator.data:
+                _LOGGER.debug(
+                    "No IO outputs found yet for %s, no number entities created",
+                    config.title,
+                )
+            else:
+                entities_to_add.extend(
+                    OpenWB2MqttIONumber(coordinator, output_name, config)
+                    for output_name in coordinator.data
+                    if output_name.lower().startswith(IO_PREFIX_ANALOG_OUTPUT)
                 )
         async_add_entities(entities_to_add)
     else:
@@ -178,6 +193,88 @@ class OpenWB2MqttApiNumber(CoordinatorEntity, NumberEntity):
 
         # Fallback to refresh if optimistic update fails
         await self.coordinator.async_request_refresh()
+
+    @property
+    def device_info(self):
+        """Return the device info."""
+        return {
+            "identifiers": {(DOMAIN, self.config_entry.title)},
+            "name": self.config_entry.title,
+            "manufacturer": MANUFACTURER,
+        }
+
+
+class OpenWB2MqttIONumber(CoordinatorEntity, NumberEntity):
+    """A single analog output of an openWB IO device (e.g. Dimm & Control).
+
+    Only implemented for the HTTP simpleAPI (openWB/core PR #3568). Entities
+    are created dynamically - one per analog output key (e.g. "AO1") found in
+    the coordinator response. Min/max/step are generic defaults (0-100, step 1,
+    typical for a 0-100% dimming/analog output) since openWB's simpleAPI does
+    not report a range for a given output; adjust in HA if your hardware uses
+    a different range (e.g. 0-10V).
+    """
+
+    _attr_native_min_value = 0
+    _attr_native_max_value = 100
+    _attr_native_step = 1
+    _attr_mode = NumberMode.BOX
+
+    def __init__(
+        self,
+        coordinator: OpenWB2MqttDataUpdateCoordinator,
+        output_name: str,
+        config_entry: ConfigEntry,
+    ) -> None:
+        """Initialize the number entity."""
+        super().__init__(coordinator)
+        self._output_name = output_name
+        self.config_entry = config_entry
+        self._attr_name = output_name
+        self._attr_unique_id = slugify(f"{config_entry.title}_{output_name}")
+        self.entity_id = (
+            f"{NUMBER_DOMAIN}.{slugify(f'{config_entry.title}_{output_name}')}"
+        )
+
+    @property
+    def native_value(self):
+        """Return the current value of the analog output."""
+        if self.coordinator.data is None:
+            return None
+        try:
+            value = self.coordinator.data.get(self._output_name)
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    async def async_set_native_value(self, value: float) -> None:
+        """Write the analog output value via the openWB simpleAPI.
+
+        Uses ?set_io_output=<value>&io_nr=<id>&io_output=<name>&io_output_type=analog
+        (POST), see openWB/core PR #3568.
+        """
+        io_id = self.coordinator.device_id
+        payload = (
+            f"set_io_output={value}&io_nr={io_id}&io_output={self._output_name}"
+            "&io_output_type=analog"
+        )
+        try:
+            await self.coordinator.client.async_set_data(payload)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception(
+                "Error setting analog IO output %s (id=%s) to %s",
+                self._output_name,
+                io_id,
+                value,
+            )
+            return
+
+        # Optimistic update; the next coordinator refresh (15s) will correct it
+        # if openWB rejected the change.
+        if self.coordinator.data is not None:
+            new_data = dict(self.coordinator.data)
+            new_data[self._output_name] = value
+            self.coordinator.async_set_updated_data(new_data)
 
     @property
     def device_info(self):

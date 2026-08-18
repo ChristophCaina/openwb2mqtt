@@ -49,6 +49,7 @@ PLATFORMS = [
     Platform.NUMBER,
     Platform.SELECT,
     Platform.SENSOR,
+    Platform.SWITCH,
 ]
 
 # Global values
@@ -97,6 +98,9 @@ DATA_SCHEMA_MQTT = vol.Schema(
                     SelectOptionDict(value="pv", label="PV Generator"),
                     SelectOptionDict(value="bat", label="Battery"),
                     SelectOptionDict(value="vehicle", label="Vehicle"),
+                    SelectOptionDict(
+                        value="io", label="IO-Gerät (z.B. Dimm & Control)"
+                    ),
                 ],
                 mode=SelectSelectorMode.DROPDOWN,
                 translation_key="config_selector_devicetype",  # translation is maintained in translations/<lang>.json via this translation_key
@@ -121,14 +125,55 @@ DATA_SCHEMA_API = vol.Schema(
                     SelectOptionDict(value="pv", label="PV Generator"),
                     SelectOptionDict(value="bat", label="Battery"),
                     # SelectOptionDict(value="vehicle", label="Vehicle"),
+                    SelectOptionDict(
+                        value="io", label="IO-Gerät (z.B. Dimm & Control)"
+                    ),
                 ],
                 mode=SelectSelectorMode.DROPDOWN,
                 translation_key="config_selector_devicetype",  # translation is maintained in translations/<lang>.json via this translation_key
             )
         ),
-        vol.Required(DEVICEID, default=4): cv.positive_int,
+        # Geräte-ID in openWB (siehe Status-Tab). Bei den Gerätetypen "pv" und
+        # "chargepoint" kann hier alternativ das Wort "total" eingetragen werden -
+        # das spiegelt genau das openWB simpleAPI Konzept wider (?get_pv_power=total
+        # statt ?get_pv_power=<ID>, siehe openWB/core PR #3568) und liefert den über
+        # alle vorhandenen IDs der Komponente aufsummierten Wert.
+        # Beim Gerätetyp "io" kann statt einer ID auch "auto" eingetragen werden
+        # (openWB verwendet dann automatisch das einzige/erste IO-Gerät).
+        # NOTE: plain cv.string on purpose - voluptuous_serialize (used by HA to
+        # render the config-flow form) cannot serialize a vol.Any() mixing
+        # cv.positive_int with a string/"total"/"auto" branch. Validation of
+        # "numeric or total/auto" happens in config_flow.py instead.
+        vol.Required(DEVICEID, default="4"): cv.string,
     }
 )
+
+# Pseudo-ID, die openWB selbst als Wert für "über alle IDs summiert" verwendet.
+TOTAL_ID = "total"
+# Pseudo-ID für IO-Geräte: openWB verwendet automatisch das einzige/erste
+# vorhandene IO-Gerät (openWB/core PR #3568).
+AUTO_ID = "auto"
+# Namenspräfixe der vier IO-Kategorien (openWB Dimm & Control Kit etc.,
+# openWB/core PR #3568). Nur Ausgänge (DO/AO) sind über set_io_output
+# schreibbar; Eingänge (DI/AI) sind rein lesend.
+IO_PREFIX_DIGITAL_OUTPUT = "do"  # z.B. DO1, LED1 -> switch (lesen+schreiben)
+IO_PREFIX_ANALOG_OUTPUT = "ao"  # z.B. AO1 -> number (lesen+schreiben)
+IO_PREFIX_DIGITAL_INPUT = "di"  # z.B. DI1 -> binary_sensor (nur lesen)
+IO_PREFIX_ANALOG_INPUT = "ai"  # z.B. AI1 -> sensor (nur lesen)
+# Rückwärtskompatibler Alias.
+IO_ANALOG_OUTPUT_PREFIX = IO_PREFIX_ANALOG_OUTPUT
+# Anzahl der digitalen Ausgänge (DO1..DOn), die openWB Ein-/Ausgangsgeräte
+# (z.B. Dimm & Control Kit) typischerweise haben. Wird für die MQTT-basierte
+# Steuerung genutzt (openWB/set/system/io/<ID>/set/manual/digital_output/DOn),
+# die - anders als die simpleAPI - schon heute funktioniert, unabhängig vom
+# Status von PR #3568. Bei abweichender Ausgangszahl ggf. anpassen.
+IO_MQTT_DIGITAL_OUTPUT_COUNT = 8
+# Anzahl der digitalen bzw. analogen Eingänge (DI1..DIn / AI1..AIn). Wie oben:
+# fixe Anzahl, da MQTT-Modus keine Discovery kennt. Bestätigte Topics (siehe
+# MQTT Explorer): {mqtt_root}/io/states/<ID>/get/digital_input bzw.
+# .../analog_input, jeweils ein JSON-Objekt mit allen Ein-/Ausgängen.
+IO_MQTT_DIGITAL_INPUT_COUNT = 8
+IO_MQTT_ANALOG_INPUT_COUNT = 8
 
 DATA_SCHEMA_OPTIONS_CP = vol.Schema(
     {
@@ -1492,6 +1537,143 @@ BINARY_SENSORS_PER_PVGENERATOR = [
         name="Fehler",
         device_class=BinarySensorDeviceClass.PROBLEM,
         entity_category=EntityCategory.DIAGNOSTIC,
+    ),
+]
+
+# "Total" sensors: aggregated values summed by openWB itself over all component IDs,
+# fetched via ?get_pv_<metric>=total / ?get_chargepoint_<metric>=total (HTTP simpleAPI
+# only, see openWB/core PR #3568 "Add total values to simpleAPI").
+SENSORS_PER_PVGENERATOR_TOTAL = [
+    openwbSensorEntityDescription(
+        key="power",
+        api_key="power",
+        name="Leistung (Gesamt)",
+        device_class=SensorDeviceClass.POWER,
+        native_unit_of_measurement=UnitOfPower.WATT,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_registry_enabled_default=True,
+        icon="mdi:solar-power",
+        suggested_display_precision=0,
+        value_fn=lambda x: abs(_safeFloat(x)) if _safeFloat(x) is not None else None,
+    ),
+    openwbSensorEntityDescription(
+        key="imported",
+        api_key="imported",
+        name="Zählerstand Bezug (Gesamt)",
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        state_class=SensorStateClass.TOTAL,
+        value_fn=lambda x: round(_safeFloat(x) / 1000.0, 3)
+        if _safeFloat(x) is not None
+        else None,
+        suggested_display_precision=0,
+        icon="mdi:counter",
+    ),
+    openwbSensorEntityDescription(
+        key="exported",
+        api_key="exported",
+        name="Zählerstand (Gesamt)",
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        state_class=SensorStateClass.TOTAL,
+        value_fn=lambda x: round(_safeFloat(x) / 1000.0, 3)
+        if _safeFloat(x) is not None
+        else None,
+        suggested_display_precision=0,
+        icon="mdi:counter",
+    ),
+    openwbSensorEntityDescription(
+        key="monthly_exported",
+        api_key="monthly_exported",
+        name="Zählerstand (Monat, Gesamt)",
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        state_class=SensorStateClass.TOTAL,
+        value_fn=lambda x: round(_safeFloat(x) / 1000.0, 3)
+        if _safeFloat(x) is not None
+        else None,
+        suggested_display_precision=0,
+        icon="mdi:counter",
+    ),
+    openwbSensorEntityDescription(
+        key="yearly_exported",
+        api_key="yearly_exported",
+        name="Zählerstand (Jahr, Gesamt)",
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        state_class=SensorStateClass.TOTAL,
+        value_fn=lambda x: round(_safeFloat(x) / 1000.0, 3)
+        if _safeFloat(x) is not None
+        else None,
+        suggested_display_precision=0,
+        icon="mdi:counter",
+    ),
+]
+
+SENSORS_PER_CHARGEPOINT_TOTAL = [
+    openwbSensorEntityDescription(
+        key="power",
+        api_key="power",
+        name="Ladeleistung (Gesamt)",
+        device_class=SensorDeviceClass.POWER,
+        native_unit_of_measurement=UnitOfPower.WATT,
+        state_class=SensorStateClass.MEASUREMENT,
+        icon="mdi:car-electric-outline",
+    ),
+    openwbSensorEntityDescription(
+        key="imported",
+        api_key="imported",
+        name="Geladene Energie (Gesamt, alle Ladepunkte)",
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        state_class=SensorStateClass.TOTAL,
+        value_fn=lambda x: round(_safeFloat(x) / 1000, 3)
+        if _safeFloat(x) is not None
+        else None,
+        suggested_display_precision=0,
+        icon="mdi:counter",
+    ),
+    openwbSensorEntityDescription(
+        key="exported",
+        api_key="exported",
+        name="Entladene Energie (Gesamt, alle Ladepunkte)",
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        state_class=SensorStateClass.TOTAL,
+        value_fn=lambda x: round(_safeFloat(x) / 1000, 3)
+        if _safeFloat(x) is not None
+        else None,
+        suggested_display_precision=0,
+        icon="mdi:counter",
+        entity_registry_enabled_default=False,
+    ),
+    openwbSensorEntityDescription(
+        key="monthly_exported",
+        api_key="monthly_exported",
+        name="Entladene Energie (Monat, Gesamt)",
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        state_class=SensorStateClass.TOTAL,
+        value_fn=lambda x: round(_safeFloat(x) / 1000, 3)
+        if _safeFloat(x) is not None
+        else None,
+        suggested_display_precision=0,
+        icon="mdi:counter",
+        entity_registry_enabled_default=False,
+    ),
+    openwbSensorEntityDescription(
+        key="yearly_exported",
+        api_key="yearly_exported",
+        name="Entladene Energie (Jahr, Gesamt)",
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        state_class=SensorStateClass.TOTAL,
+        value_fn=lambda x: round(_safeFloat(x) / 1000, 3)
+        if _safeFloat(x) is not None
+        else None,
+        suggested_display_precision=0,
+        icon="mdi:counter",
+        entity_registry_enabled_default=False,
     ),
 ]
 

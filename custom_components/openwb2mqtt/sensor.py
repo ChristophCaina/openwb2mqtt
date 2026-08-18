@@ -19,15 +19,22 @@ from .common import OpenWBBaseEntity, async_setup_sensors
 from .const import (
     COMM_METHOD_HTTP,
     COMMUNICATION_METHOD,
+    DEVICEID,
     DEVICETYPE,
     DOMAIN,
+    IO_MQTT_ANALOG_INPUT_COUNT,
+    IO_PREFIX_ANALOG_INPUT,
     MANUFACTURER,
+    MQTT_ROOT_TOPIC,
     SENSORS_CONTROLLER,
     SENSORS_PER_BATTERY,
     SENSORS_PER_CHARGEPOINT,
+    SENSORS_PER_CHARGEPOINT_TOTAL,
     SENSORS_PER_COUNTER,
     SENSORS_PER_PVGENERATOR,
+    SENSORS_PER_PVGENERATOR_TOTAL,
     SENSORS_PER_VEHICLE,
+    TOTAL_ID,
     openwbDynamicSensorEntityDescription,
     openwbSensorEntityDescription,
 )
@@ -41,12 +48,25 @@ async def async_setup_entry(
 ) -> None:
     """Set up sensors for openWB."""
     device_type = config.data[DEVICETYPE]
+    # "total": pv/chargepoint aggregated across all IDs (openWB simpleAPI "total"
+    # pseudo-ID, openWB/core PR #3568), entered in the DEVICEID field instead of a
+    # numeric ID.
+    is_total = device_type in ("pv", "chargepoint") and str(
+        config.data.get(DEVICEID, "")
+    ).lower() == TOTAL_ID
     sensors_to_add = []
 
     if config.data.get(COMMUNICATION_METHOD) == COMM_METHOD_HTTP:
         coordinator = hass.data[DOMAIN][config.entry_id]
         if device_type == "controller":
             for description in SENSORS_CONTROLLER:
+                if description.api_key is None:
+                    continue
+                sensors_to_add.append(
+                    OpenWB2MqttApiSensor(coordinator, description, config)
+                )
+        elif device_type == "chargepoint" and is_total:
+            for description in SENSORS_PER_CHARGEPOINT_TOTAL:
                 if description.api_key is None:
                     continue
                 sensors_to_add.append(
@@ -74,12 +94,33 @@ async def async_setup_entry(
                 sensors_to_add.append(
                     OpenWB2MqttApiSensor(coordinator, description, config)
                 )
+        elif device_type == "pv" and is_total:
+            for description in SENSORS_PER_PVGENERATOR_TOTAL:
+                if description.api_key is None:
+                    continue
+                sensors_to_add.append(
+                    OpenWB2MqttApiSensor(coordinator, description, config)
+                )
         elif device_type == "pv":
             for description in SENSORS_PER_PVGENERATOR:
                 if description.api_key is None:
                     continue
                 sensors_to_add.append(
                     OpenWB2MqttApiSensor(coordinator, description, config)
+                )
+        elif device_type == "io":
+            # Dynamic: one sensor per analog input found in the API response
+            # (e.g. "AI1"), see openWB/core PR #3568. Read-only.
+            if not coordinator.data:
+                _LOGGER.debug(
+                    "No IO inputs found yet for %s, no sensor entities created",
+                    config.title,
+                )
+            else:
+                sensors_to_add.extend(
+                    OpenWB2MqttIOAnalogInputSensor(coordinator, input_name, config)
+                    for input_name in coordinator.data
+                    if input_name.lower().startswith(IO_PREFIX_ANALOG_INPUT)
                 )
         # Device type vehicle not yet implemented in API
         # elif device_type == "vehicle":
@@ -182,6 +223,23 @@ async def async_setup_entry(
                 "Vehicle",
                 process_vehicle_topics,
             )
+        elif device_type == "io":
+            # Analog inputs (AI1..AIn), read-only. State topic confirmed via
+            # MQTT Explorer: ONE JSON message with all inputs, e.g.
+            # {"AI1": 0, "AI2": 0, ...}.
+            mqtt_root = config.data[MQTT_ROOT_TOPIC]
+            device_id = config.data[DEVICEID]
+            entities = [
+                openwbIOAnalogInputSensor(
+                    uniqueID=config.unique_id,
+                    device_friendly_name=f"IO {device_id}",
+                    mqtt_root=mqtt_root,
+                    device_id=device_id,
+                    input_name=f"AI{n}",
+                )
+                for n in range(1, IO_MQTT_ANALOG_INPUT_COUNT + 1)
+            ]
+            async_add_entities(entities)
 
 
 class OpenWB2MqttApiSensor(CoordinatorEntity, SensorEntity):
@@ -248,6 +306,102 @@ class OpenWB2MqttApiSensor(CoordinatorEntity, SensorEntity):
             "name": self.config_entry.title,
             "manufacturer": MANUFACTURER,
         }
+
+
+class OpenWB2MqttIOAnalogInputSensor(CoordinatorEntity, SensorEntity):
+    """A single analog input of an openWB IO device (e.g. Dimm & Control).
+
+    Read-only: openWB's simpleAPI only exposes set_io_output for outputs, not
+    inputs (openWB/core PR #3568). Entities are created dynamically - one per
+    analog input key (e.g. "AI1") found in the coordinator response. No unit
+    is assumed since openWB doesn't report one for a given input.
+    """
+
+    def __init__(
+        self,
+        coordinator: OpenWB2MqttDataUpdateCoordinator,
+        input_name: str,
+        config_entry: ConfigEntry,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator)
+        self._input_name = input_name
+        self.config_entry = config_entry
+        self._attr_name = input_name
+        self._attr_unique_id = slugify(f"{config_entry.title}_{input_name}")
+        self.entity_id = (
+            f"sensor.{slugify(f'{config_entry.title}_{input_name}')}"
+        )
+
+    @property
+    def native_value(self):
+        """Return the current value of the analog input."""
+        if self.coordinator.data is None:
+            return None
+        return self.coordinator.data.get(self._input_name)
+
+    @property
+    def device_info(self):
+        """Return the device info."""
+        return {
+            "identifiers": {(DOMAIN, self.config_entry.title)},
+            "name": self.config_entry.title,
+            "manufacturer": MANUFACTURER,
+        }
+
+
+class openwbIOAnalogInputSensor(OpenWBBaseEntity, SensorEntity):
+    """A single analog input of an openWB IO device, read via MQTT.
+
+    Read-only. State topic confirmed via MQTT Explorer:
+    {mqtt_root}/io/states/{id}/get/analog_input - ONE shared JSON message
+    for all inputs, e.g. {"AI1": 0, "AI2": 0, ...}. No unit assumed since
+    openWB doesn't report one for a given input.
+    """
+
+    def __init__(
+        self,
+        uniqueID: str,
+        device_friendly_name: str,
+        mqtt_root: str,
+        device_id: int,
+        input_name: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(device_friendly_name=device_friendly_name, mqtt_root=mqtt_root)
+        self._input_name = input_name
+        self._attr_name = input_name
+        self._attr_unique_id = slugify(f"{uniqueID}-io-{device_id}-{input_name}")
+        self.entity_id = (
+            f"sensor.{slugify(f'{uniqueID}_io_{device_id}_{input_name}')}"
+        )
+        self._attr_native_value = None
+        self._state_topic = f"{mqtt_root}/io/states/{device_id}/get/analog_input"
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to MQTT events."""
+
+        @callback
+        def message_received(message):
+            """Handle new MQTT messages (state update)."""
+            try:
+                payload = json.loads(message.payload)
+            except (json.JSONDecodeError, TypeError):
+                _LOGGER.warning(
+                    "Could not parse JSON on topic %s: %s",
+                    self._state_topic,
+                    message.payload,
+                )
+                return
+
+            if self._input_name not in payload:
+                return
+
+            self._attr_native_value = payload[self._input_name]
+            self.async_write_ha_state()
+
+        await mqtt.async_subscribe(self.hass, self._state_topic, message_received, 1)
+        _LOGGER.debug("Subscribed to IO input MQTT topic: %s", self._state_topic)
 
 
 class openwbSensor(OpenWBBaseEntity, SensorEntity):
