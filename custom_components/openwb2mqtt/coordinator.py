@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 from datetime import timedelta
-import json
 import logging
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from homeassistant.util import slugify
 
 from .api_client import (
     OpenWB2MqttApiClient,
@@ -164,39 +162,62 @@ class OpenWB2MqttDataUpdateCoordinator(DataUpdateCoordinator):
     async def _async_get_io_outputs(self) -> dict:
         """Fetch all digital+analog outputs of an IO device (e.g. Dimm & Control).
 
-        Uses openWB's ?get_io_output_all=<ID|auto> feature (openWB/core PR #3568).
-        Returns a flat dict of {output_name: value}, e.g. {"DO1": 0, "AO1": 45.5}.
-
-        NOTE: The exact JSON response shape was not documented in the PR text, so
-        this parses defensively (nested under "io_<id>" like other components, or
-        already flat) and logs a warning if neither shape matches.
+        Uses openWB's ?get_io_output_all=<ID|auto> (simpleAPI, openWB >= 2.3.0)
+        and returns a flat dict of {output_name: value}, e.g.
+        {"DO1": False, ..., "AO1": 45.5}. See flatten_io_output_response().
         """
         response = await self.client.async_get_data(
             f"?get_io_output_all={self._device_id}"
         )
         _LOGGER.debug("IO output response for id=%s: %s", self._device_id, response)
 
-        if not isinstance(response, dict):
-            return {}
+        result = flatten_io_output_response(response)
+        if not result:
+            _LOGGER.warning(
+                "No IO outputs found for IO device id=%s in response: %s",
+                self._device_id,
+                response,
+            )
+        return result
 
-        # Expected shape (matches other component responses): {"io_2": {...}}
-        for key, value in response.items():
-            if key.lower().startswith("io_") and isinstance(value, dict):
-                return value
 
-        # Fallback: response may already be flat, e.g. {"DO1": 0, "AO1": 45.5}
-        # without an "io_<id>" wrapper. Filter out any obvious metadata keys
-        # (success/message) that some simpleAPI endpoints add.
-        flat_result = {
-            k: v for k, v in response.items() if k not in ("success", "message")
-        }
-        if flat_result:
-            return flat_result
+def flatten_io_output_response(response) -> dict:
+    """Flatten the simpleAPI ?get_io_output_all response.
 
-        _LOGGER.warning(
-            "Unexpected response shape for IO device id=%s, could not find "
-            "an 'io_<id>' key or flat output keys in: %s",
-            self._device_id,
-            response,
-        )
+    openWB 2.3.0 answers (confirmed on a real system)::
+
+        {"io_0": {"digital_output": {"DO1": false, ...},
+                  "analog_output": []}}
+
+    Note: an empty map is serialized by PHP as list ``[]``, not ``{}``.
+    With "auto" as ID the key is the resolved one (e.g. "io_0").
+    A response that is already flat ({"DO1": false, ...}) is accepted too.
+    """
+    if not isinstance(response, dict):
         return {}
+
+    io_data = None
+    for key, value in response.items():
+        if str(key).lower().startswith("io_") and isinstance(value, dict):
+            io_data = value
+            break
+    if io_data is None:
+        io_data = response
+
+    result: dict = {}
+    nested = False
+    for group in ("digital_output", "analog_output"):
+        if group in io_data:
+            nested = True
+            outputs = io_data[group]
+            if isinstance(outputs, dict):
+                result.update(outputs)
+    if nested:
+        return result
+
+    # Already flat: keep only output-like keys, drop metadata (success/message).
+    return {
+        k: v
+        for k, v in io_data.items()
+        if k not in ("success", "message") and not isinstance(v, (dict, list))
+    }
