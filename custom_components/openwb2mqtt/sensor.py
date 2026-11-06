@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 import json
 import logging
+from typing import Any
 
 from homeassistant.components import mqtt
 from homeassistant.components.sensor import SensorEntity
@@ -13,15 +15,17 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
-from homeassistant.util import slugify
+from homeassistant.util import dt as dt_util, slugify
 
 from .common import OpenWBBaseEntity, async_setup_sensors
 from .const import (
     COMM_METHOD_HTTP,
     COMMUNICATION_METHOD,
+    DEVICEID,
     DEVICETYPE,
     DOMAIN,
     MANUFACTURER,
+    MQTT_ROOT_TOPIC,
     SENSORS_CONTROLLER,
     SENSORS_PER_BATTERY,
     SENSORS_PER_CHARGEPOINT,
@@ -32,8 +36,20 @@ from .const import (
     openwbSensorEntityDescription,
 )
 from .coordinator import OpenWB2MqttDataUpdateCoordinator
+from .messages import (
+    EVENT_SYSTEM_MESSAGE,
+    MAX_MESSAGES_IN_ATTRIBUTES,
+    SystemMessage,
+    SystemMessageCollection,
+    truncate,
+)
 
 _LOGGER = logging.getLogger(__name__)
+
+# A message whose timestamp is at most this much older than our subscription
+# is treated as "new" even if it was delivered as retained message (e.g. via a
+# broker bridge that keeps the retain flag).
+SYSTEM_MESSAGE_EVENT_GRACE = timedelta(seconds=30)
 
 
 async def async_setup_entry(
@@ -100,6 +116,24 @@ async def async_setup_entry(
                 SENSORS_CONTROLLER,
                 "{mqtt_root}/{key}",
                 MANUFACTURER,
+            )
+            # System messages (issue #6): topic ends with a changing id, so
+            # these entities subscribe with a wildcard.
+            mqtt_root = config.data[MQTT_ROOT_TOPIC]
+            device_friendly_name = f"{MANUFACTURER} {config.data[DEVICEID]}"
+            async_add_entities(
+                [
+                    openwbSystemMessagesSensor(
+                        uniqueID=config.unique_id,
+                        device_friendly_name=device_friendly_name,
+                        mqtt_root=mqtt_root,
+                    ),
+                    openwbLatestSystemMessageSensor(
+                        uniqueID=config.unique_id,
+                        device_friendly_name=device_friendly_name,
+                        mqtt_root=mqtt_root,
+                    ),
+                ]
             )
         elif device_type == "chargepoint":
             regular_sensors = [
@@ -479,3 +513,156 @@ class openwbDynamicSensor(OpenWBBaseEntity, SensorEntity):
 
         if self._unsubscribe_template is not None:
             self._unsubscribe_template()
+
+
+class _openwbSystemMessageBase(OpenWBBaseEntity, SensorEntity):
+    """Common base for the system message sensors (issue #6).
+
+    Subscribes to ``<mqtt_root>/system/messages/+`` and keeps all currently
+    retained messages in a :class:`SystemMessageCollection`.
+    """
+
+    _attr_should_poll = False
+    _name: str
+    _key: str
+
+    def __init__(
+        self,
+        uniqueID: str | None,
+        device_friendly_name: str,
+        mqtt_root: str,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(
+            device_friendly_name=device_friendly_name,
+            mqtt_root=mqtt_root,
+        )
+        self._attr_name = self._name
+        self._attr_unique_id = slugify(f"{uniqueID}_{self._key}")
+        self.entity_id = f"sensor.{slugify(f'{uniqueID}_{self._key}')}"
+        self._topic = f"{mqtt_root}/system/messages/+"
+        self._collection = SystemMessageCollection()
+        self._subscribed_at = dt_util.utcnow()
+        self._unsubscribe = None
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to MQTT events."""
+
+        @callback
+        def message_received(message) -> None:
+            new_message = self._collection.update(message.topic, message.payload)
+            if new_message is not None and self._is_live(message, new_message):
+                self._on_new_message(new_message)
+            self._update_from_collection()
+            self.async_write_ha_state()
+
+        self._subscribed_at = dt_util.utcnow()
+        self._unsubscribe = await mqtt.async_subscribe(
+            self.hass, self._topic, message_received, 1
+        )
+        _LOGGER.debug("Subscribed to MQTT topic: %s", self._topic)
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Unsubscribe from MQTT."""
+        if self._unsubscribe is not None:
+            self._unsubscribe()
+            self._unsubscribe = None
+
+    def _is_live(self, message, system_message: SystemMessage) -> bool:
+        """Return True if the message was published while we are running.
+
+        Retained messages that are replayed on (re)subscribe are old news and
+        must not trigger events again.
+        """
+        if not getattr(message, "retain", False):
+            return True
+        if system_message.timestamp is None:
+            return False
+        return (
+            system_message.timestamp
+            >= self._subscribed_at - SYSTEM_MESSAGE_EVENT_GRACE
+        )
+
+    def _on_new_message(self, system_message: SystemMessage) -> None:
+        """Handle a newly published message (default: nothing)."""
+
+    def _update_from_collection(self) -> None:
+        """Update the entity attributes from the collection."""
+        raise NotImplementedError
+
+
+class openwbSystemMessagesSensor(_openwbSystemMessageBase):
+    """Number of active openWB system messages, details as attributes.
+
+    Additionally fires the ``openwb2mqtt_system_message`` event for every
+    message openWB publishes while Home Assistant is running, so it can be
+    used as automation trigger (e.g. notification "openWB needs a restart").
+    """
+
+    _name = "Systemmeldungen"
+    _key = "system_messages"
+    _attr_icon = "mdi:message-alert-outline"
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Initialize the sensor."""
+        super().__init__(*args, **kwargs)
+        self._attr_native_value = 0
+        self._attr_extra_state_attributes = {
+            "messages": [],
+            "highest_severity": None,
+        }
+
+    def _on_new_message(self, system_message: SystemMessage) -> None:
+        self.hass.bus.async_fire(
+            EVENT_SYSTEM_MESSAGE,
+            {
+                "mqtt_root": self.mqtt_root,
+                "device": self.device_friendly_name,
+                **system_message.as_dict(),
+            },
+        )
+
+    def _update_from_collection(self) -> None:
+        messages = self._collection.messages
+        self._attr_native_value = len(messages)
+        self._attr_extra_state_attributes = {
+            "messages": [
+                m.as_dict() for m in messages[:MAX_MESSAGES_IN_ATTRIBUTES]
+            ],
+            "highest_severity": self._collection.highest_severity,
+        }
+
+
+class openwbLatestSystemMessageSensor(_openwbSystemMessageBase):
+    """Text of the newest openWB system message (HTML stripped)."""
+
+    _name = "Letzte Systemmeldung"
+    _key = "latest_system_message"
+    _attr_icon = "mdi:message-text-outline"
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        """Initialize the sensor."""
+        super().__init__(*args, **kwargs)
+        self._attr_native_value = None
+        self._attr_extra_state_attributes = {}
+
+    def _update_from_collection(self) -> None:
+        latest = self._collection.latest
+        if latest is None:
+            self._attr_native_value = None
+            self._attr_icon = "mdi:message-text-outline"
+            self._attr_extra_state_attributes = {}
+            return
+        self._attr_native_value = truncate(latest.message)
+        self._attr_icon = _SYSTEM_MESSAGE_ICONS.get(
+            latest.type, "mdi:message-text-outline"
+        )
+        self._attr_extra_state_attributes = latest.as_dict()
+
+
+_SYSTEM_MESSAGE_ICONS = {
+    "info": "mdi:information-outline",
+    "success": "mdi:check-circle-outline",
+    "warning": "mdi:alert-outline",
+    "danger": "mdi:alert-octagon-outline",
+}

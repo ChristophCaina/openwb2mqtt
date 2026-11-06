@@ -21,6 +21,12 @@ This file explains the MQTT topic patterns used by the openWB integration. Use t
     *   `system/lastlivevaluesJson`
     *   `vehicle/{vehicle_id}/name` (subscribes to multiple vehicle names from id 0-10)
 
+### System messages (`messages.py`)
+*   **Direction**: `in`
+*   **Topic Path**: `{mqttRoot}/system/messages/+` (last level is a millisecond timestamp, changes for every message)
+*   **Payload**: `{"message": "...", "source": "command", "timestamp": 1762527574, "type": "info|success|warning|danger"}`, empty payload = message removed
+*   **Entities**: `Systemmeldungen`, `Letzte Systemmeldung`, event `openwb2mqtt_system_message`
+
 ---
 
 ## Chargepoint

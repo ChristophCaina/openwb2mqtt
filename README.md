@@ -150,6 +150,20 @@ This integration can create the following device types in Home Assistant:
     *   **Sensors:** State of charge (SoC), range, and last update timestamp.
 *   **Controller:** Represents the central openWB unit.
     *   **Sensors:** Total house consumption, total PV, total charging power, etc.
+    *   **System messages (MQTT only):** `Systemmeldungen` (number of active messages, all messages as attribute `messages`) and `Letzte Systemmeldung` (text of the newest message, HTML removed). Every new message openWB publishes (e.g. *"Bitte die openWB neu starten…"*) additionally fires the Home Assistant event `openwb2mqtt_system_message`, which can be used as an automation trigger:
+
+        ```yaml
+        triggers:
+          - trigger: event
+            event_type: openwb2mqtt_system_message
+            event_data:
+              type: danger   # optional: info, success, warning, danger
+        actions:
+          - action: notify.notify
+            data:
+              title: openWB
+              message: "{{ trigger.event.data.message }}"
+        ```
 
 ---
 
