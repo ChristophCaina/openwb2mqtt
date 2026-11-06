@@ -230,3 +230,72 @@ def limit_is_controllable_consumer(key: str | None) -> bool | None:
     if key is None:
         return None
     return key in CONTROLLABLE_CONSUMER_LIMITS
+
+
+def outputs_used_by_action(config: dict[str, Any] | None, io_device_id) -> set[str]:
+    """Return the digital outputs of IO device ``io_device_id`` an action drives.
+
+    - dimming / dimming_direct_control / ripple_control_receiver list them in
+      ``configuration.devices`` as ``{"type": "io", "id": 1,
+      "digital_output": "DO2"}``.
+    - stepwise_control passes the stages through to ``io_output_device``
+      via the keys of ``configuration.output_pattern[*].matrix``.
+
+    openWB rewrites these outputs in every control cycle, so a manual
+    override would only last a few seconds anyway.
+    """
+    if not config:
+        return set()
+    configuration = config.get("configuration") or {}
+    io_id = str(io_device_id)
+    outputs: set[str] = set()
+
+    for device in configuration.get("devices") or []:
+        if (
+            isinstance(device, dict)
+            and device.get("type") == "io"
+            and str(device.get("id")) == io_id
+            and device.get("digital_output")
+        ):
+            outputs.add(str(device["digital_output"]))
+
+    if (
+        configuration.get("passthrough_enabled")
+        and configuration.get("io_output_device") is not None
+        and str(configuration.get("io_output_device")) == io_id
+    ):
+        for pattern in configuration.get("output_pattern") or []:
+            if isinstance(pattern, dict) and isinstance(pattern.get("matrix"), dict):
+                outputs.update(str(k) for k in pattern["matrix"])
+
+    return outputs
+
+
+class IoOutputLockTracker:
+    """Tracks which IO actions use which outputs of one IO device."""
+
+    def __init__(self, io_device_id) -> None:
+        """Initialize the tracker."""
+        self._io_device_id = io_device_id
+        self._actions: dict[str, tuple[str, set[str]]] = {}
+
+    def update(self, topic: str, payload) -> bool:
+        """Process ``io/action/<id>/config``; return True if anything changed."""
+        action_id = action_id_from_topic(topic)
+        if action_id is None:
+            return False
+        config = parse_action_config(payload)
+        old = self._actions.get(action_id)
+        if config is None:
+            self._actions.pop(action_id, None)
+            return old is not None
+        name = config.get("name") or f"IO-Aktion {action_id}"
+        new = (name, outputs_used_by_action(config, self._io_device_id))
+        self._actions[action_id] = new
+        return old != new
+
+    def locked_by(self, output_name: str) -> list[str]:
+        """Return the names of the actions that drive ``output_name``."""
+        return sorted(
+            name for name, outputs in self._actions.values() if output_name in outputs
+        )

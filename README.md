@@ -149,6 +149,9 @@ This integration can create the following device types in Home Assistant:
     *   **Sensors:** Power, current, daily/monthly/yearly energy production.
 *   **Vehicle:** Represents a vehicle configured in openWB.
     *   **Sensors:** State of charge (SoC), range, and last update timestamp.
+*   **IO device (e.g. openWB Dimm & Control Kit):**
+    *   **Binary sensors / sensors:** digital inputs `DI1`–`DI8`, analog inputs `AI1`–`AI8` (MQTT only, the simpleAPI does not provide inputs) and the digital outputs as read-only `DO1 Status`–`DO8 Status`.
+    *   **Switches:** `DO1`–`DO8` via openWB's manual output control. Outputs that an openWB IO action drives (e.g. *Dimmen per EMS* passing the grid operator's dimming on to a heat pump) are **locked** (MQTT only): the switch shows a lock icon, the attributes `locked` / `locked_by`, and switching raises an error. openWB rewrites these outputs every control cycle anyway, and overriding them would bypass the §14a EnWG control.
 *   **Controller:** Represents the central openWB unit.
     *   **Sensors:** Total house consumption, total PV, total charging power, etc.
     *   **System messages (MQTT only):** `Systemmeldungen` (number of active messages, all messages as attribute `messages`) and `Letzte Systemmeldung` (text of the newest message, HTML removed). Every new message openWB publishes (e.g. *"Bitte die openWB neu starten…"*) additionally fires the Home Assistant event `openwb2mqtt_system_message`, which can be used as an automation trigger:

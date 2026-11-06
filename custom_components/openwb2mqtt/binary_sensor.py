@@ -32,7 +32,9 @@ from .const import (
     DEVICETYPE,
     DOMAIN,
     IO_MQTT_DIGITAL_INPUT_COUNT,
+    IO_MQTT_DIGITAL_OUTPUT_COUNT,
     IO_PREFIX_DIGITAL_INPUT,
+    IO_PREFIX_DIGITAL_OUTPUT,
     MANUFACTURER,
     MQTT_ROOT_TOPIC,
     openwbBinarySensorEntityDescription,
@@ -92,8 +94,7 @@ async def async_setup_entry(
             # response (e.g. "DI1"), see openWB/core PR #3568. Read-only.
             if not coordinator.data:
                 _LOGGER.debug(
-                    "No IO inputs found yet for %s, no binary_sensor entities "
-                    "created",
+                    "No IO inputs found yet for %s, no binary_sensor entities created",
                     config.title,
                 )
             else:
@@ -101,6 +102,14 @@ async def async_setup_entry(
                     OpenWB2MqttIOBinarySensor(coordinator, input_name, config)
                     for input_name in coordinator.data
                     if input_name.lower().startswith(IO_PREFIX_DIGITAL_INPUT)
+                )
+                # Digital outputs as read-only status sensors too.
+                sensors_to_add.extend(
+                    OpenWB2MqttIOBinarySensor(
+                        coordinator, output_name, config, name_suffix=" Status"
+                    )
+                    for output_name in coordinator.data
+                    if output_name.lower().startswith(IO_PREFIX_DIGITAL_OUTPUT)
                 )
         # Device type vehicle not yet implemented in API
         # elif device_type == "vehicle":
@@ -183,6 +192,19 @@ async def async_setup_entry(
                 )
                 for n in range(1, IO_MQTT_DIGITAL_INPUT_COUNT + 1)
             ]
+            # Digital outputs as read-only status sensors as well (the switches
+            # in switch.py may be locked by IO actions).
+            entities.extend(
+                openwbIODigitalInputBinarySensor(
+                    uniqueID=config.unique_id,
+                    device_friendly_name=f"IO {device_id}",
+                    mqtt_root=mqtt_root,
+                    device_id=device_id,
+                    input_name=f"DO{n}",
+                    io_group="digital_output",
+                )
+                for n in range(1, IO_MQTT_DIGITAL_OUTPUT_COUNT + 1)
+            )
             async_add_entities(entities)
         elif device_type == "controller":
             await async_setup_io_action_discovery(hass, config, async_add_entities)
@@ -301,15 +323,17 @@ class OpenWB2MqttIOBinarySensor(CoordinatorEntity, BinarySensorEntity):
         coordinator: OpenWB2MqttDataUpdateCoordinator,
         input_name: str,
         config_entry: ConfigEntry,
+        name_suffix: str = "",
     ) -> None:
         """Initialize the binary sensor."""
         super().__init__(coordinator)
         self._input_name = input_name
         self.config_entry = config_entry
-        self._attr_name = input_name
-        self._attr_unique_id = slugify(f"{config_entry.title}_{input_name}")
+        self._attr_name = f"{input_name}{name_suffix}"
+        self._attr_unique_id = slugify(f"{config_entry.title}_{self._attr_name}")
         self.entity_id = (
-            f"{BINARY_SENSOR_DOMAIN}.{slugify(f'{config_entry.title}_{input_name}')}"
+            f"{BINARY_SENSOR_DOMAIN}."
+            f"{slugify(f'{config_entry.title}_{self._attr_name}')}"
         )
 
     @property
@@ -358,18 +382,26 @@ class openwbIODigitalInputBinarySensor(OpenWBBaseEntity, BinarySensorEntity):
         mqtt_root: str,
         device_id: int,
         input_name: str,
+        io_group: str = "digital_input",
     ) -> None:
-        """Initialize the binary sensor."""
+        """Initialize the binary sensor.
+
+        ``io_group`` is "digital_input" (DI) or "digital_output" (DO, shown as
+        read-only status next to the switch).
+        """
         super().__init__(device_friendly_name=device_friendly_name, mqtt_root=mqtt_root)
         self._input_name = input_name
-        self._attr_name = input_name
-        self._attr_unique_id = slugify(f"{uniqueID}-io-{device_id}-{input_name}")
+        suffix = "" if io_group == "digital_input" else "_status"
+        self._attr_name = input_name if not suffix else f"{input_name} Status"
+        self._attr_unique_id = slugify(
+            f"{uniqueID}-io-{device_id}-{input_name}{suffix}"
+        )
         self.entity_id = (
             f"{BINARY_SENSOR_DOMAIN}."
-            f"{slugify(f'{uniqueID}_io_{device_id}_{input_name}')}"
+            f"{slugify(f'{uniqueID}_io_{device_id}_{input_name}{suffix}')}"
         )
         self._attr_is_on = None
-        self._state_topic = f"{mqtt_root}/io/states/{device_id}/get/digital_input"
+        self._state_topic = f"{mqtt_root}/io/states/{device_id}/get/{io_group}"
 
     async def async_added_to_hass(self) -> None:
         """Subscribe to MQTT events."""

@@ -23,6 +23,7 @@ from homeassistant.components import mqtt
 from homeassistant.components.switch import DOMAIN as SWITCH_DOMAIN, SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import slugify
@@ -40,6 +41,7 @@ from .const import (
     MQTT_ROOT_TOPIC,
 )
 from .coordinator import OpenWB2MqttDataUpdateCoordinator
+from .io_actions import IoOutputLockTracker
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -195,6 +197,28 @@ class openwbIODigitalOutputSwitch(OpenWBBaseEntity, SwitchEntity):
             f"{mqtt_root}/set/system/io/{device_id}/set/manual/digital_output/"
             f"{output_name}"
         )
+        # Outputs driven by an openWB IO action (e.g. "Dimmen per EMS" passing
+        # the grid operator's dimming on to a heat pump) are locked: openWB
+        # rewrites them every control cycle, and overriding them would bypass
+        # the §14a EnWG control.
+        self._action_config_topic = f"{mqtt_root}/io/action/+/config"
+        self._lock_tracker = IoOutputLockTracker(device_id)
+        self._unsubscribers: list = []
+
+    @property
+    def locked_by(self) -> list[str]:
+        """Names of the openWB IO actions that drive this output."""
+        return self._lock_tracker.locked_by(self._output_name)
+
+    @property
+    def icon(self) -> str | None:
+        """Show a lock while the output is reserved by an IO action."""
+        return "mdi:lock" if self.locked_by else None
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        """Expose whether and by which action the output is locked."""
+        return {"locked": bool(self.locked_by), "locked_by": self.locked_by}
 
     async def async_added_to_hass(self) -> None:
         """Subscribe to MQTT events."""
@@ -226,13 +250,43 @@ class openwbIODigitalOutputSwitch(OpenWBBaseEntity, SwitchEntity):
                 self._attr_is_on = bool(value)
             self.async_write_ha_state()
 
-        await mqtt.async_subscribe(self.hass, self._state_topic, message_received, 1)
+        @callback
+        def action_config_received(message):
+            """Track which IO actions use this output."""
+            if self._lock_tracker.update(message.topic, message.payload):
+                self.async_write_ha_state()
+
+        self._unsubscribers = [
+            await mqtt.async_subscribe(
+                self.hass, self._state_topic, message_received, 1
+            ),
+            await mqtt.async_subscribe(
+                self.hass, self._action_config_topic, action_config_received, 1
+            ),
+        ]
         _LOGGER.debug("Subscribed to IO output MQTT topic: %s", self._state_topic)
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Unsubscribe from MQTT."""
+        for unsubscribe in self._unsubscribers:
+            if callable(unsubscribe):
+                unsubscribe()
+        self._unsubscribers = []
+
+    def _raise_if_locked(self) -> None:
+        if self.locked_by:
+            raise HomeAssistantError(
+                f"{self._output_name} wird von der openWB-Aktion "
+                f"'{', '.join(self.locked_by)}' gesteuert und kann nicht manuell "
+                "geschaltet werden."
+            )
 
     async def async_turn_on(self, **kwargs) -> None:
         """Turn the output on."""
+        self._raise_if_locked()
         await mqtt.async_publish(self.hass, self._command_topic, "true", 0, False)
 
     async def async_turn_off(self, **kwargs) -> None:
         """Turn the output off."""
+        self._raise_if_locked()
         await mqtt.async_publish(self.hass, self._command_topic, "false", 0, False)

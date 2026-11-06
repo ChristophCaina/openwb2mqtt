@@ -65,7 +65,7 @@ async def _coordinator(hass: HomeAssistant, entry, response):
 
 
 async def test_http_io_entities_from_real_response(hass: HomeAssistant) -> None:
-    """8 switches, no numbers/binary sensors/sensors for the real response."""
+    """8 switches + 8 status sensors, nothing else for the real response."""
     entry = MockConfigEntry(
         domain=DOMAIN,
         title="openWB-io-auto",
@@ -93,7 +93,10 @@ async def test_http_io_entities_from_real_response(hass: HomeAssistant) -> None:
 
     assert [e.name for e in created["switch"]] == [f"DO{n}" for n in range(1, 9)]
     assert created["number"] == []
-    assert created["binary_sensor"] == []
+    assert [e.name for e in created["binary_sensor"]] == [
+        f"DO{n} Status" for n in range(1, 9)
+    ]
+    assert created["binary_sensor"][0].is_on is False
     assert created["sensor"] == []
 
     do1 = created["switch"][0]
