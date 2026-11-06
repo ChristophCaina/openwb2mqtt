@@ -8,8 +8,6 @@ import datetime
 import json
 from zoneinfo import ZoneInfo
 
-import voluptuous as vol
-
 from homeassistant.components.binary_sensor import (
     BinarySensorDeviceClass,
     BinarySensorEntityDescription,
@@ -41,6 +39,9 @@ from homeassistant.helpers.selector import (
     SelectSelectorConfig,
     SelectSelectorMode,
 )
+import voluptuous as vol
+
+from .io_actions import LIMIT_OPTIONS, limit_is_controllable_consumer, parse_limit
 
 # Platform.SWITCH,
 PLATFORMS = [
@@ -828,6 +829,31 @@ SENSORS_PER_CHARGEPOINT = [
         )
         if _safeNestedGet(x, "chargemode", "eco_charging", "max_price") is not None
         else None,
+    ),
+]
+
+# Reason why openWB currently limits the charge power of a chargepoint, incl.
+# dimming via Dimm & Control Kit / §14a EnWG (issue #7). MQTT only, topic
+# {mqtt_root}/chargepoint/{id}/control_parameter/limit.
+SENSORS_PER_CHARGEPOINT_CONTROL = [
+    openwbSensorEntityDescription(
+        key="control_parameter/limit",
+        api_key=None,
+        name="Leistungsbegrenzung",
+        device_class=SensorDeviceClass.ENUM,
+        options=LIMIT_OPTIONS,
+        icon="mdi:speedometer-slow",
+        value_fn=lambda x: parse_limit(x)[0],
+    ),
+]
+
+BINARY_SENSORS_PER_CHARGEPOINT_CONTROL = [
+    openwbBinarySensorEntityDescription(
+        key="control_parameter/limit",
+        api_key=None,
+        name="Gedimmt",
+        icon="mdi:transmission-tower-export",
+        state=lambda x: limit_is_controllable_consumer(parse_limit(x)[0]),
     ),
 ]
 

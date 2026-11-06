@@ -29,6 +29,7 @@ from .const import (
     SENSORS_CONTROLLER,
     SENSORS_PER_BATTERY,
     SENSORS_PER_CHARGEPOINT,
+    SENSORS_PER_CHARGEPOINT_CONTROL,
     SENSORS_PER_COUNTER,
     SENSORS_PER_PVGENERATOR,
     SENSORS_PER_VEHICLE,
@@ -140,7 +141,7 @@ async def async_setup_entry(
                 desc
                 for desc in SENSORS_PER_CHARGEPOINT
                 if not isinstance(desc, openwbDynamicSensorEntityDescription)
-            ]
+            ] + SENSORS_PER_CHARGEPOINT_CONTROL
             dynamic_sensors = [
                 desc
                 for desc in SENSORS_PER_CHARGEPOINT

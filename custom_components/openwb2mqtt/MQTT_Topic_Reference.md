@@ -27,9 +27,20 @@ This file explains the MQTT topic patterns used by the openWB integration. Use t
 *   **Payload**: `{"message": "...", "source": "command", "timestamp": 1762527574, "type": "info|success|warning|danger"}`, empty payload = message removed
 *   **Entities**: `Systemmeldungen`, `Letzte Systemmeldung`, event `openwb2mqtt_system_message`
 
+### IO actions (`io_actions.py`, binary sensors created dynamically)
+*   **Direction**: `in`
+*   **Topic Path**: `{mqttRoot}/io/action/+/config` (discovery, name, affected devices), `{mqttRoot}/io/action/{id}/timestamp` (active since, `null` = inactive)
+*   **Types with state**: `dimming`, `dimming_direct_control`, `ripple_control_receiver`, `stepwise_control`
+
 ---
 
 ## Chargepoint
+
+### SENSORS_PER_CHARGEPOINT_CONTROL / BINARY_SENSORS_PER_CHARGEPOINT_CONTROL
+*   **Direction**: `in`
+*   **Topic Path**: `{mqttRoot}/chargepoint/{deviceID}/control_parameter/limit`
+*   **Payload**: `{"message": ", da die Dimmung die Ladeleistung begrenzt.", "limiting_value": "<LimitingValue template>"}`
+*   **Entities**: `Leistungsbegrenzung` (enum), `Gedimmt` (binary)
 
 ### SENSORS_PER_CHARGEPOINT
 *   **Direction**: `in`

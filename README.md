@@ -139,6 +139,7 @@ This integration can create the following device types in Home Assistant:
 
 *   **Charge Point:** Represents a charging port on your openWB.
     *   **Sensors:** Power, current, energy, plug state, etc.
+    *   **Power limit (MQTT only):** `Leistungsbegrenzung` shows why openWB currently limits the charge power (`none`, `dimming`, `dimming_via_direct_control`, `ripple_control_receiver`, `loadmanager`, `current`, `power`, …) and the binary sensor `Gedimmt` is `on` while the charge point is limited by grid operator control (§14a EnWG: dimming, direct control, ripple control receiver or failsafe of the IO device).
     *   **Controls:** Charge mode, target SoC, vehicle selection, etc.
 *   **Counter:** Represents a power meter (e.g., your grid connection point).
     *   **Sensors:** Power (total and per phase), current, voltage, imported/exported energy.
@@ -164,6 +165,7 @@ This integration can create the following device types in Home Assistant:
               title: openWB
               message: "{{ trigger.event.data.message }}"
         ```
+    *   **IO actions / Dimm & Control Kit (MQTT only):** For every IO action configured in openWB that reports an active state (*Dimmen per EMS*, *Dimmen per Direktsteuerung*, *RSE-Kontakt*, *Stufenweise Steuerung von EZA*) a binary sensor is created automatically. It is `on` while openWB applies the action; the attributes list the affected devices (charge points, IO outputs) and `active_since`.
 
 ---
 

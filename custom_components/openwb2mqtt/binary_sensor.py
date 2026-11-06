@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 import logging
+from typing import Any
 
 from homeassistant.components import mqtt
 from homeassistant.components.binary_sensor import (
@@ -19,17 +21,28 @@ from .common import OpenWBBaseEntity, async_setup_binary_sensors
 from .const import (
     BINARY_SENSORS_PER_BATTERY,
     BINARY_SENSORS_PER_CHARGEPOINT,
+    BINARY_SENSORS_PER_CHARGEPOINT_CONTROL,
     BINARY_SENSORS_PER_COUNTER,
     BINARY_SENSORS_PER_PVGENERATOR,
     BINARY_SENSORS_PER_VEHICLE,
     COMM_METHOD_HTTP,
     COMMUNICATION_METHOD,
+    DEVICEID,
     DEVICETYPE,
     DOMAIN,
     MANUFACTURER,
+    MQTT_ROOT_TOPIC,
     openwbBinarySensorEntityDescription,
 )
 from .coordinator import OpenWB2MqttDataUpdateCoordinator
+from .io_actions import (
+    action_attributes,
+    action_has_state,
+    action_icon,
+    action_id_from_topic,
+    parse_action_config,
+    parse_action_timestamp,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -91,6 +104,15 @@ async def async_setup_entry(
                 topic_template,
                 "Chargepoint",
             )
+            # Power limit / dimming state (issue #7), not below ".../get/".
+            await async_setup_binary_sensors(
+                hass,
+                config,
+                async_add_entities,
+                BINARY_SENSORS_PER_CHARGEPOINT_CONTROL,
+                "{mqtt_root}/{device_type}/{device_id}/{key}",
+                "Chargepoint",
+            )
         elif device_type == "counter":
             await async_setup_binary_sensors(
                 hass,
@@ -127,6 +149,54 @@ async def async_setup_entry(
                 topic_template,
                 "Vehicle",
             )
+        elif device_type == "controller":
+            await async_setup_io_action_discovery(hass, config, async_add_entities)
+
+
+async def async_setup_io_action_discovery(
+    hass: HomeAssistant, config: ConfigEntry, async_add_entities: AddEntitiesCallback
+) -> None:
+    """Create one binary sensor per openWB IO action (issue #7).
+
+    IO actions (Dimmen per EMS, Dimmen per Direktsteuerung, RSE-Kontakt,
+    stufenweise Steuerung, ...) are configured in openWB and evaluate the
+    inputs of IO devices like the Dimm & Control Kit. They are discovered
+    via ``<root>/io/action/+/config``; each action gets a binary sensor that
+    is on while openWB reports the action as active.
+    """
+    mqtt_root = config.data[MQTT_ROOT_TOPIC]
+    device_friendly_name = f"{MANUFACTURER} {config.data[DEVICEID]}"
+    known_actions: set[str] = set()
+
+    @callback
+    def config_received(message) -> None:
+        action_id = action_id_from_topic(message.topic)
+        if action_id is None or action_id in known_actions:
+            return
+        action_config = parse_action_config(message.payload)
+        if action_config is None or not action_has_state(action_config):
+            return
+        known_actions.add(action_id)
+        _LOGGER.debug(
+            "Discovered openWB IO action %s (%s)",
+            action_id,
+            action_config.get("type"),
+        )
+        async_add_entities(
+            [
+                openwbIoActionBinarySensor(
+                    uniqueID=config.unique_id,
+                    device_friendly_name=device_friendly_name,
+                    mqtt_root=mqtt_root,
+                    action_id=action_id,
+                    action_config=action_config,
+                )
+            ]
+        )
+
+    topic = f"{mqtt_root}/io/action/+/config"
+    config.async_on_unload(await mqtt.async_subscribe(hass, topic, config_received, 1))
+    _LOGGER.debug("Subscribed to MQTT topic: %s", topic)
 
 
 class OpenWB2MqttApiBinarySensor(CoordinatorEntity, BinarySensorEntity):
@@ -244,3 +314,92 @@ class openwbBinarySensor(OpenWBBaseEntity, BinarySensorEntity):
             message_received,
             1,
         )
+
+
+class openwbIoActionBinarySensor(OpenWBBaseEntity, BinarySensorEntity):
+    """State of an openWB IO action, e.g. "Dimmen per EMS" (issue #7).
+
+    On while the action is active, i.e. while openWB publishes a timestamp
+    on ``<root>/io/action/<id>/timestamp`` (``null`` = inactive). The
+    affected devices (chargepoints, IO outputs) are exposed as attributes.
+    """
+
+    _attr_should_poll = False
+
+    def __init__(
+        self,
+        uniqueID: str | None,
+        device_friendly_name: str,
+        mqtt_root: str,
+        action_id: str,
+        action_config: dict[str, Any],
+    ) -> None:
+        """Initialize the binary sensor."""
+        super().__init__(
+            device_friendly_name=device_friendly_name,
+            mqtt_root=mqtt_root,
+        )
+        self._action_id = action_id
+        self._attr_unique_id = slugify(f"{uniqueID}-io-action-{action_id}")
+        self.entity_id = (
+            f"{BINARY_SENSOR_DOMAIN}.{slugify(f'{uniqueID}_io_action_{action_id}')}"
+        )
+        self._config_topic = f"{mqtt_root}/io/action/{action_id}/config"
+        self._timestamp_topic = f"{mqtt_root}/io/action/{action_id}/timestamp"
+        self._active_since: datetime | None = None
+        # openWB only publishes the (retained) timestamp once the action was
+        # active; without it the action is inactive.
+        self._attr_is_on = False
+        self._unsubscribers: list = []
+        self._apply_config(action_config)
+
+    def _apply_config(self, action_config: dict[str, Any]) -> None:
+        self._action_config = action_config
+        self._attr_name = action_config.get("name") or f"IO-Aktion {self._action_id}"
+        self._attr_icon = action_icon(action_config)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return details about the action and the affected devices."""
+        return {
+            **action_attributes(self._action_config),
+            "active_since": (
+                self._active_since.isoformat() if self._active_since else None
+            ),
+        }
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe to MQTT events."""
+
+        @callback
+        def config_received(message) -> None:
+            action_config = parse_action_config(message.payload)
+            if action_config is None:
+                # Action was deleted in openWB.
+                self._attr_available = False
+            else:
+                self._attr_available = True
+                self._apply_config(action_config)
+            self.async_write_ha_state()
+
+        @callback
+        def timestamp_received(message) -> None:
+            self._active_since = parse_action_timestamp(message.payload)
+            self._attr_is_on = self._active_since is not None
+            self.async_write_ha_state()
+
+        self._unsubscribers = [
+            await mqtt.async_subscribe(
+                self.hass, self._config_topic, config_received, 1
+            ),
+            await mqtt.async_subscribe(
+                self.hass, self._timestamp_topic, timestamp_received, 1
+            ),
+        ]
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Unsubscribe from MQTT."""
+        for unsubscribe in self._unsubscribers:
+            if callable(unsubscribe):
+                unsubscribe()
+        self._unsubscribers = []
