@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 
 from homeassistant.components import mqtt
 from homeassistant.components.switch import DOMAIN as SWITCH_DOMAIN, SwitchEntity
@@ -25,6 +26,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import slugify
 
@@ -44,6 +46,96 @@ from .coordinator import OpenWB2MqttDataUpdateCoordinator
 from .io_actions import IoOutputLockTracker
 
 _LOGGER = logging.getLogger(__name__)
+
+# openWB applies manual output changes only in its next control cycle (~10 s)
+# and reports the new state afterwards. Until then it keeps reporting the old
+# state, which made the switch jump back (HA on -> off -> on). After a command
+# the switch therefore shows the requested state until openWB confirms it, at
+# most for this many seconds; then the reported state wins again.
+PENDING_STATE_TIMEOUT = 30
+
+
+class PendingSwitchState:
+    """Requested switch state that is shown until the device confirms it."""
+
+    def __init__(self, timeout: float = PENDING_STATE_TIMEOUT) -> None:
+        """Initialize without a pending state."""
+        self.timeout = timeout
+        self._target: bool | None = None
+        self._deadline = 0.0
+
+    @property
+    def active(self) -> bool:
+        """Return True while a requested state is waiting for confirmation."""
+        return self._target is not None and time.monotonic() < self._deadline
+
+    def set(self, target: bool) -> None:
+        """Remember a requested state."""
+        self._target = target
+        self._deadline = time.monotonic() + self.timeout
+
+    def clear(self) -> None:
+        """Forget the requested state."""
+        self._target = None
+
+    def resolve(self, actual: bool | None) -> bool | None:
+        """Return the state to show for the reported state ``actual``."""
+        if not self.active:
+            self._target = None
+            return actual
+        if actual == self._target:
+            # Confirmed by openWB.
+            self._target = None
+            return actual
+        return self._target
+
+
+def _parse_output_value(value) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "on")
+    return bool(value)
+
+
+class _PendingStateSwitch(SwitchEntity):
+    """Switch that keeps a requested state until openWB confirms it."""
+
+    _pending: PendingSwitchState
+    _cancel_pending_timeout = None
+
+    def _init_pending(self) -> None:
+        self._pending = PendingSwitchState()
+        self._cancel_pending_timeout = None
+
+    @callback
+    def _start_pending(self, target: bool) -> None:
+        """Show ``target`` until confirmed or the timeout expires."""
+        self._pending.set(target)
+        if self._cancel_pending_timeout is not None:
+            self._cancel_pending_timeout()
+
+        @callback
+        def _expired(_now) -> None:
+            self._cancel_pending_timeout = None
+            if self._pending.active:
+                return
+            self._on_pending_expired()
+            self.async_write_ha_state()
+
+        # +1 s so the deadline has certainly passed when the callback runs.
+        self._cancel_pending_timeout = async_call_later(
+            self.hass, self._pending.timeout + 1, _expired
+        )
+
+    def _on_pending_expired(self) -> None:
+        """Fall back to the last reported state (override if needed)."""
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Cancel a running pending timeout."""
+        if self._cancel_pending_timeout is not None:
+            self._cancel_pending_timeout()
+            self._cancel_pending_timeout = None
 
 
 async def async_setup_entry(
@@ -89,7 +181,7 @@ async def async_setup_entry(
     async_add_entities(entities)
 
 
-class OpenWB2MqttIOSwitch(CoordinatorEntity, SwitchEntity):
+class OpenWB2MqttIOSwitch(CoordinatorEntity, _PendingStateSwitch):
     """A single digital output of an openWB IO device (e.g. Dimm & Control)."""
 
     def __init__(
@@ -100,6 +192,7 @@ class OpenWB2MqttIOSwitch(CoordinatorEntity, SwitchEntity):
     ) -> None:
         """Initialize the switch."""
         super().__init__(coordinator)
+        self._init_pending()
         self._output_name = output_name
         self.config_entry = config_entry
         self._attr_name = output_name
@@ -110,15 +203,11 @@ class OpenWB2MqttIOSwitch(CoordinatorEntity, SwitchEntity):
 
     @property
     def is_on(self) -> bool | None:
-        """Return true if the output is on."""
-        if self.coordinator.data is None:
-            return None
-        value = self.coordinator.data.get(self._output_name)
-        if value is None:
-            return None
-        if isinstance(value, str):
-            return value.strip().lower() in ("1", "true", "on")
-        return bool(value)
+        """Return true if the output is on (requested state while pending)."""
+        actual = None
+        if self.coordinator.data is not None:
+            actual = _parse_output_value(self.coordinator.data.get(self._output_name))
+        return self._pending.resolve(actual)
 
     async def async_turn_on(self, **kwargs) -> None:
         """Turn the output on."""
@@ -147,12 +236,11 @@ class OpenWB2MqttIOSwitch(CoordinatorEntity, SwitchEntity):
             )
             return
 
-        # Optimistic update; the next coordinator refresh (15s) will correct it
-        # if openWB rejected the change.
-        if self.coordinator.data is not None:
-            new_data = dict(self.coordinator.data)
-            new_data[self._output_name] = value
-            self.coordinator.async_set_updated_data(new_data)
+        # Show the requested state until openWB confirms it (see
+        # PENDING_STATE_TIMEOUT); the coordinator data keeps the real state so
+        # the "DOx Status" sensors are not affected.
+        self._start_pending(bool(value))
+        self.async_write_ha_state()
 
     @property
     def device_info(self):
@@ -164,7 +252,7 @@ class OpenWB2MqttIOSwitch(CoordinatorEntity, SwitchEntity):
         }
 
 
-class openwbIODigitalOutputSwitch(OpenWBBaseEntity, SwitchEntity):
+class openwbIODigitalOutputSwitch(OpenWBBaseEntity, _PendingStateSwitch):
     """A single digital output of an openWB IO device, controlled via MQTT.
 
     - Command: {mqtt_root}/set/system/io/{id}/set/manual/digital_output/{name}
@@ -192,6 +280,8 @@ class openwbIODigitalOutputSwitch(OpenWBBaseEntity, SwitchEntity):
             f"{SWITCH_DOMAIN}.{slugify(f'{uniqueID}_io_{device_id}_{output_name}')}"
         )
         self._attr_is_on = None
+        self._reported_is_on: bool | None = None
+        self._init_pending()
         self._state_topic = f"{mqtt_root}/io/states/{device_id}/get/digital_output"
         self._command_topic = (
             f"{mqtt_root}/set/system/io/{device_id}/set/manual/digital_output/"
@@ -243,11 +333,8 @@ class openwbIODigitalOutputSwitch(OpenWBBaseEntity, SwitchEntity):
             if self._output_name not in payload:
                 return
 
-            value = payload[self._output_name]
-            if isinstance(value, str):
-                self._attr_is_on = value.strip().lower() in ("true", "1", "on")
-            else:
-                self._attr_is_on = bool(value)
+            self._reported_is_on = _parse_output_value(payload[self._output_name])
+            self._attr_is_on = self._pending.resolve(self._reported_is_on)
             self.async_write_ha_state()
 
         @callback
@@ -268,10 +355,23 @@ class openwbIODigitalOutputSwitch(OpenWBBaseEntity, SwitchEntity):
 
     async def async_will_remove_from_hass(self) -> None:
         """Unsubscribe from MQTT."""
+        await super().async_will_remove_from_hass()
         for unsubscribe in self._unsubscribers:
             if callable(unsubscribe):
                 unsubscribe()
         self._unsubscribers = []
+
+    def _on_pending_expired(self) -> None:
+        self._attr_is_on = self._reported_is_on
+
+    async def _async_command(self, target: bool) -> None:
+        self._raise_if_locked()
+        await mqtt.async_publish(
+            self.hass, self._command_topic, "true" if target else "false", 0, False
+        )
+        self._start_pending(target)
+        self._attr_is_on = target
+        self.async_write_ha_state()
 
     def _raise_if_locked(self) -> None:
         if self.locked_by:
@@ -283,10 +383,8 @@ class openwbIODigitalOutputSwitch(OpenWBBaseEntity, SwitchEntity):
 
     async def async_turn_on(self, **kwargs) -> None:
         """Turn the output on."""
-        self._raise_if_locked()
-        await mqtt.async_publish(self.hass, self._command_topic, "true", 0, False)
+        await self._async_command(True)
 
     async def async_turn_off(self, **kwargs) -> None:
         """Turn the output off."""
-        self._raise_if_locked()
-        await mqtt.async_publish(self.hass, self._command_topic, "false", 0, False)
+        await self._async_command(False)

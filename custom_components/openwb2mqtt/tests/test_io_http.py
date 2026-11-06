@@ -100,9 +100,13 @@ async def test_http_io_entities_from_real_response(hass: HomeAssistant) -> None:
     assert created["sensor"] == []
 
     do1 = created["switch"][0]
+    do1.hass = hass
+    do1.async_write_ha_state = MagicMock()
     assert do1.is_on is False
     await do1.async_turn_on()
     client.async_set_data.assert_called_once_with(
         "set_io_output=1&io_nr=auto&io_output=DO1"
     )
     assert do1.is_on is True
+    # the status sensor keeps showing the real state reported by openWB
+    assert created["binary_sensor"][0].is_on is False
